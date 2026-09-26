@@ -20,6 +20,7 @@ from .anonymizer import (
 from .geo import MAX_ZOOM_LIMIT, assign_cells, prepare_points
 from .geo_bounds import count_bounds, prepare_bounds, prepare_cells
 from .intersection import audit_intersections
+from .round_table import prepare_counts, prepare_totals, solve_rounding
 from .spacetime import assign_joint
 from .time_windows import MAX_WINDOW_HOURS_LIMIT, assign_windows, prepare_records
 
@@ -47,8 +48,12 @@ app = FastAPI(
         "对经纬矩形查询区把格分为完全落入、部分相交、不相交三类，"
         "分别汇总区域观测数的下界与上界；查询经度起点大于终点时按跨 180° "
         "经线的两个区间处理。"
+        "另提供观测计数交叉表受控舍入：把非负整数计数矩阵逐格舍入到 base "
+        "倍数以降低公开精度，每格只取向下或向上的 base 倍数（整倍数格不变），"
+        "在满足目标行列合计的所有方案中最小化逐格绝对改变量之和，"
+        "返回舍入矩阵、实际行列合计与总改变量。"
     ),
-    version="1.5.0",
+    version="1.6.0",
 )
 
 
@@ -317,6 +322,34 @@ class GeoCountBoundsResponse(BaseModel):
     total_count: int
 
 
+class RoundCountTableRequest(BaseModel):
+    """观测计数交叉表受控舍入请求体。"""
+
+    counts: list[Any] = Field(
+        ..., description="1～20 行、1～20 列的非负整数计数矩阵"
+    )
+    # 拒绝 bool 冒充整数；base 必须为正整数。
+    base: StrictInt = Field(..., description="舍入基数（正整数）")
+    row_totals: list[Any] = Field(
+        ..., description="目标行合计：非负的 base 倍数，长度等于行数"
+    )
+    column_totals: list[Any] = Field(
+        ..., description="目标列合计：非负的 base 倍数，长度等于列数"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RoundCountTableResponse(BaseModel):
+    """观测计数交叉表受控舍入结果。"""
+
+    rounded_counts: list[list[int]]
+    row_totals: list[int]
+    column_totals: list[int]
+    total_change: int
+    base: int
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     """服务信息。"""
@@ -330,6 +363,7 @@ def root() -> dict[str, str]:
         "time_anonymize": f"{API_PREFIX}/time-anonymize",
         "spacetime_anonymize": f"{API_PREFIX}/spacetime-anonymize",
         "geo_count_bounds": f"{API_PREFIX}/geo-count-bounds",
+        "round_count_table": f"{API_PREFIX}/round-count-table",
     }
 
 
@@ -564,4 +598,34 @@ def geo_count_bounds(request: GeoCountBoundsRequest) -> GeoCountBoundsResponse:
         longitude_intervals=longitude_intervals,
         total_cells=len(cells),
         total_count=sum(cell[3] for cell in cells),
+    )
+
+
+@app.post(
+    f"{API_PREFIX}/round-count-table",
+    response_model=RoundCountTableResponse,
+)
+def round_count_table(request: RoundCountTableRequest) -> RoundCountTableResponse:
+    """把观测计数交叉表逐格舍入到 base 倍数，同时满足目标行列合计。"""
+    if request.base < 1:
+        raise unprocessable("base 必须是正整数（>= 1）")
+
+    counts = prepare_counts(request.counts)
+    row_totals, column_totals = prepare_totals(
+        request.row_totals,
+        request.column_totals,
+        len(counts),
+        len(counts[0]),
+        request.base,
+    )
+    rounded, total_change = solve_rounding(
+        counts, request.base, row_totals, column_totals
+    )
+
+    return RoundCountTableResponse(
+        rounded_counts=rounded,
+        row_totals=[sum(row) for row in rounded],
+        column_totals=[sum(column) for column in zip(*rounded)],
+        total_change=total_change,
+        base=request.base,
     )

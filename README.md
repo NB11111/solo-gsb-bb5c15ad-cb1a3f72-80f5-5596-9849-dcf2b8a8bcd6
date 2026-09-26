@@ -21,6 +21,10 @@
 `z/x/y` 格与各格计数，对任意经纬矩形查询区，仅依据公开格计算区域内
 观测数的**下界与上界**——完全落入查询区的格计入两界，仅部分相交的格
 只计入上界，不相交的格不计入。
+以及**观测计数交叉表受控舍入**：把非负整数计数矩阵（如“保护站 × 物种”
+交叉表）逐格舍入到 **base** 的倍数以降低公开精度——每格只取原值向下或
+向上的 base 倍数（整倍数格保持原值），在满足目标行列合计的所有方案中
+**最小化逐格绝对改变量之和**，返回舍入矩阵、实际行列合计与总改变量。
 
 服务为纯内存、无状态处理：**原始记录不写日志、不落盘、不挂载数据卷**。
 
@@ -39,6 +43,7 @@ docker compose up --build
 - 观测时间窗口匿名化接口：`POST http://localhost:8000/api/v1/time-anonymize`
 - 时空联合匿名发布接口：`POST http://localhost:8000/api/v1/spacetime-anonymize`
 - 公开格区域计数上下界接口：`POST http://localhost:8000/api/v1/geo-count-bounds`
+- 观测计数交叉表受控舍入接口：`POST http://localhost:8000/api/v1/round-count-table`
 - 健康检查：`GET http://localhost:8000/api/v1/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -686,6 +691,82 @@ curl -s http://localhost:8000/api/v1/geo-count-bounds \
 - 任一边界不是有限数值（含字符串、布尔值、`NaN`、无穷）或超出
   纬度 -90～90、经度 -180～180；
 - 查询区为零面积矩形：`lat_min >= lat_max` 或 `lon_min == lon_max`；
+- 请求体缺少必填字段或出现未声明字段。
+
+## 观测计数交叉表受控舍入
+
+`POST /api/v1/round-count-table`，`Content-Type: application/json`。
+
+直接发布精确的观测计数交叉表（如“保护站 × 物种”计数矩阵）会暴露
+敏感位置的详细数量。本接口把矩阵**逐格舍入到 base 的倍数**后再公开：
+每格只能取原值**向下或向上到 base 倍数**的值（已是 base 整倍数的格
+保持原值），同时必须满足调用方给定的**目标行列合计**。在所有满足
+合计约束的舍入方案中，服务用最小费用流求出**逐格绝对改变量之和最小**
+的矩阵；同成本的最优解可能不止一个，返回其中任一。
+
+### 请求格式
+
+```json
+{
+  "counts": [
+    [3, 7, 12],
+    [5, 2, 8],
+    [11, 6, 1]
+  ],
+  "base": 5,
+  "row_totals": [20, 15, 20],
+  "column_totals": [20, 15, 20]
+}
+```
+
+- `counts`：**1～20 行、1～20 列**的非负整数矩形矩阵（原始计数表）。
+- `base`：正整数，舍入基数；`base = 1` 时所有值都是整倍数，矩阵不变。
+- `row_totals` / `column_totals`：目标行/列合计，长度分别等于行数/列数；
+  每项必须是**非负的 base 倍数**，且两侧总和必须相等。
+
+### 响应格式
+
+```json
+{
+  "rounded_counts": [
+    [5, 5, 10],
+    [5, 0, 10],
+    [10, 10, 0]
+  ],
+  "row_totals": [20, 15, 20],
+  "column_totals": [20, 15, 20],
+  "total_change": 16,
+  "base": 5
+}
+```
+
+- `rounded_counts`：舍入后的矩阵（与输入同形）；每格都是 base 的倍数，
+  且只取原值向下或向上的 base 倍数。
+- `row_totals` / `column_totals`：舍入矩阵的**实际**行列合计
+  （与请求的目标合计一致）。
+- `total_change`：逐格绝对改变量之和（所有可行方案中的最小值）。
+
+仓库内 `examples/request-round-count-table.json` 为可直接使用的示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/round-count-table \
+  -H 'Content-Type: application/json' \
+  --data @examples/request-round-count-table.json
+```
+
+### 交叉表舍入接口的 422 校验
+
+以下情况返回 HTTP `422 Unprocessable Entity`（请求体结构错误同样为
+422），错误说明在响应体 `detail` 中：
+
+- `counts` 缺失、不是非空二维数组、超过 20 行或 20 列、各行长度不一致；
+- 某格不是非负整数（含负数、布尔值、浮点、字符串）；
+- `base` 不是正整数（含 `0`、负数、布尔值、非整数）；
+- `row_totals` / `column_totals` 缺失、不是数组、长度与矩阵行数/列数
+  不一致，或某项不是非负整数、不是 base 的整数倍；
+- 两侧合计的总和不相等；
+- 不存在可行解：某行/某列的目标合计超出该行/列各格能凑出的范围，
+  或行列约束组合起来无可行舍入方案；
 - 请求体缺少必填字段或出现未声明字段。
 
 ## 422 校验错误
