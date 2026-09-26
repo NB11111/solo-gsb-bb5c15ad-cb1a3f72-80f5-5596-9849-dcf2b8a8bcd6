@@ -21,6 +21,10 @@
 `z/x/y` 格与各格计数，对任意经纬矩形查询区，仅依据公开格计算区域内
 观测数的**下界与上界**——完全落入查询区的格计入两界，仅部分相交的格
 只计入上界，不相交的格不计入。
+以及**观测计数交叉表受控舍入**：给定 1～20 行、1～20 列的非负整数计数
+矩阵、正整数基数 **base** 与目标行列合计，把每格舍入到原值向下或向上的
+**base** 倍数（整倍数保持原值），使舍入后行列合计精确等于目标值，
+并在所有可行方案中最小化逐格绝对改变量之和，降低公开表格的精度。
 
 服务为纯内存、无状态处理：**原始记录不写日志、不落盘、不挂载数据卷**。
 
@@ -39,6 +43,7 @@ docker compose up --build
 - 观测时间窗口匿名化接口：`POST http://localhost:8000/api/v1/time-anonymize`
 - 时空联合匿名发布接口：`POST http://localhost:8000/api/v1/spacetime-anonymize`
 - 公开格区域计数上下界接口：`POST http://localhost:8000/api/v1/geo-count-bounds`
+- 观测计数交叉表受控舍入接口：`POST http://localhost:8000/api/v1/round-count-table`
 - 健康检查：`GET http://localhost:8000/api/v1/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -686,6 +691,88 @@ curl -s http://localhost:8000/api/v1/geo-count-bounds \
 - 任一边界不是有限数值（含字符串、布尔值、`NaN`、无穷）或超出
   纬度 -90～90、经度 -180～180；
 - 查询区为零面积矩形：`lat_min >= lat_max` 或 `lon_min == lon_max`；
+- 请求体缺少必填字段或出现未声明字段。
+
+## 观测计数交叉表受控舍入
+
+`POST /api/v1/round-count-table`，`Content-Type: application/json`。
+
+按“物种 × 保护站”等两个维度交叉统计的观测计数表，直接公开精确到个位
+会泄露各交叉单元的细节分布。本接口在发布前**降低表格精度**：把每格计数
+舍入到原值**向下或向上最近的 `base` 倍数**（已是 `base` 整倍数的格保持
+原值），同时让舍入后每行、每列的合计**精确等于**调用方指定的目标值
+（例如与已公布的边际合计保持一致），并在所有可行方案中**最小化逐格
+绝对改变量之和**；同成本的可行解可能不止一个，服务返回其中任一解。
+
+### 请求格式
+
+```json
+{
+  "counts": [
+    [12, 7],
+    [3, 9]
+  ],
+  "base": 10,
+  "row_totals": [20, 10],
+  "column_totals": [10, 20]
+}
+```
+
+- `counts`：非负整数矩阵，**1～20 行、1～20 列**，所有行等长。
+- `base`：**正整数**舍入基数；`base: 1` 时所有格都是整倍数，矩阵保持
+  原值（目标合计必须等于原始行列和）。
+- `row_totals` / `column_totals`：目标行/列合计，均为**非负的 `base`
+  倍数**；长度分别等于行数、列数，且**两侧总和必须相等**。
+
+### 响应格式
+
+上例中第 2 列目标合计 20 要求两格都向上取整，第 1 列目标合计 10 要求
+两格都向下取整，唯一可行解（也是最优解）为：
+
+```json
+{
+  "rounded_counts": [
+    [10, 10],
+    [0, 10]
+  ],
+  "row_totals": [20, 10],
+  "column_totals": [10, 20],
+  "total_change": 9,
+  "base": 10
+}
+```
+
+- `rounded_counts`：舍入后的矩阵（与输入同形）；每格都是 `base` 的倍数，
+  且只取原值向下或向上的相邻倍数。
+- `row_totals` / `column_totals`：舍入矩阵的**实际**行列合计
+  （可行时即等于请求中的目标合计）。
+- `total_change`：逐格绝对改变量之和，即
+  `sum(abs(rounded_counts[i][j] - counts[i][j]))`，为所有可行解中的
+  最小值（上例 `|12-10| + |7-10| + |3-0| + |9-10| = 9`）。
+- `base`：回显请求的舍入基数。
+
+仓库内 `examples/request-round-count-table.json` 为可直接使用的示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/round-count-table \
+  -H 'Content-Type: application/json' \
+  --data @examples/request-round-count-table.json
+```
+
+### 交叉表舍入接口的 422 校验
+
+以下情况返回 HTTP `422 Unprocessable Entity`（请求体结构错误同样为
+422），错误说明在响应体 `detail` 中：
+
+- `counts` 为空、不是数组、某一行不是非空数组、各行长度不一致，
+  或超过 20 行 / 20 列；
+- 某格计数不是非负整数（含布尔值、浮点、字符串、负数）；
+- `base` 不是正整数（含 `0`、负数、布尔值、非整数）；
+- `row_totals` / `column_totals` 长度与矩阵行数/列数不一致，
+  或某项不是**非负的 `base` 倍数**；
+- `row_totals` 与 `column_totals` 的总和不相等；
+- 不存在可行解：某行/列的目标合计超出“全部向下舍入 ～ 全部向上舍入”
+  的范围，或单侧合计虽在范围内但行列约束无法同时满足；
 - 请求体缺少必填字段或出现未声明字段。
 
 ## 422 校验错误
